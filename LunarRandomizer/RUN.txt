@@ -1,0 +1,14 @@
+Lunar Randomizer (Java)
+=======================
+
+Requires: Java 8 or newer (Windows 7: install JRE 8).
+
+  java -jar LunarRandomizer.jar
+
+Sample tables are included (enemy_master.bin, item_master.bin).
+Browse to your own extracted tables if preferred.
+
+Rebuild from source:
+  bash build.sh
+
+Theme: dark blue + gold. Tabs: Enemies | Items | Pipeline.
