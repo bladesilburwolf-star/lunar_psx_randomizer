@@ -42,7 +42,8 @@
 | +0x0A | u8 | sub-type flag | preserved |
 | +0x0B | u8 | category/equip flags | 0x01, 0x10, 0x20, 0x21, 0xA1… preserved |
 
-**Randomization policy:** buy=0 records (padding/find-only/key items) are never given an invented price — mirrors PSX convention. Sell is always `buy // 2`. Stat values > 255 look like packed multi-field data, not simple ATK, so they're left alone.
+**Randomization policy:** buy=0 records (padding/find-only/key items) are never given an invented price — mirrors PSX convention. Sell is always `buy // 2`. Stat
+ values > 255 look like packed multi-field data, not simple ATK, so they're left alone.
 
 ### Why GBA is simpler than PSX
 
@@ -100,16 +101,68 @@ This is the *runtime battle* layout — enemies loaded into battle use these slo
 | Address | Meaning |
 |---------|---------|
 | `0x02002C38` | Money (Silver) |
-| `0x02004980` | Item/equipment inventory |
+| `0x02004980` | Item/equipme
+nt inventory |
 | `0x02004A5D` | Item flags |
 | `0x02004DE4` | Cards |
 | `0x02004DC8` | Gallery |
 
 ---
 
-## Enemy table (research in progress)
+## Enemy table (research in progress - region narrowed)
 
-Claude's binary scan found pointer tables at `0x7FB29C` (2589 pointers), `0x7F8288` (1091 pointers), `0x7F9D0C` (451 pointers). The item table lives at `0x7FA424`. The enemy master table is expected nearby. **Run `gba_scan_enemy_table.py`** to locate candidates.
+### Scan history
+
+| Version | Tool | Approach | Result |
+|---------|------|----------|--------|
+| v1 | `gba_scan_enemy_table.py` | Blind scan near item table region | 9 candidates, all in 0x7FA000-0x7FB000 - false positives (shop/drop tables, not enemy stats) |
+| v2 | `gba_scan_enemy_table_v2.py` | Full-ROM blind scan with anti-item filters | Top 3: 0x8ee20/0x8ef20 (sequential index), 0x389f90 (growth table) - false positives |
+| v1-anchor | `gba_locate_enemy_table.py` | Search for known enemy stats (Deathcap 15/1/7 etc.) | User ran; 20MB CSV output. Deathcap (15/1/7) is too common - floods entire ROM with thousands of hits. |
+| v3 | `gba_locate_enemy_table_v3.py` | Focused: drops Deathcap, uses only distinctive anchors | **NEW** - pushed to repo, awaiting user run |
+
+### Key finding: both methods converge on 0x559000-0x6A0000
+
+Two independent analysis methods both point to the same broad region:
+
+1. **v2 blind scan** found many stride-0x10 candidates in 0x559000-0x591000:
+   - 0x579e50: 41 records (largest)
+   - 0x5625a0: 36 records
+   - 0x56a060: 29 records
+   - 0x55be90: 22 records
+   - 0x559930: 18 records
+   - 0x5800a0: 19 records
+   - 0x5910a8: 15 records (stride 0x18)
+
+2. **Deathcap anchor matched=3 hits** (HP=15 + EXP=1 + SIL=7 all co-located in 40-byte window):
+   Dense clusters throughout 0x590000-0x6A0000, including:
+   - 0x597a2-0x597dc (very dense)
+   - 0x5a646-0x5a69e (massive block)
+   - 0x5f38a-0x6947e (many small clusters)
+
+3. **Ruled out:**
+   - 0x315b80 (stride 0x20): sequential counter 8-157 - an index table, not stats
+   - 0x562598 (stride 0x14): interleaved incrementing growth curves - a level/growth table
+   - 0x8ee20/0x8ef20 (stride 0x10): sequential index values 10-75 - index table
+
+### Preliminary stride analysis (from Deathcap matched=3 offsets)
+
+Examining the 0x5a646 Deathcap cluster: HP at +0x26, EXP at +0x0, SIL at +0x6 within the search window. This suggests a record stride of ~0x28 (40 bytes, 20 u16 fields), with field offsets approximately HP@+0x26, SIL@+4, EXP@+6. However, this analysis from Deathcap alone is unreliable - the v3 tool's stride-alignment test across multiple distinctive anchors will give a definitive answer.
+
+### v3 approach (gba_locate_enemy_table_v3.py)
+
+Drops noisy anchors (Deathcap, Fly Trap - values too common). Uses only distinctive anchors:
+- Ammonite: 50 HP, 12 EXP, 70 Sil (SIL=70 rare)
+- Killfish: 50 HP, 7 EXP, 46 Sil (SIL=46 rare)
+- Wisp: 40 HP, 12 EXP, 56 Sil (SIL=56 rare)
+- Magic Emperor: 6800 HP (0x1A90 - extremely rare in ROM data)
+
+The tool finds 4KB regions where 2+ distinctive anchors cluster, then tests stride alignment (0x10-0x40) to find which stride divides the inter-anchor distances.
+
+### Next steps
+
+1. **Run `python gba_locate_enemy_table_v3.py lunar.gba --dump`** - this produces a small, focused console output (not a 20MB CSV) showing the best region and stride alignment scores.
+2. **Alternatively/also run `python gba_dump_candidates.py lunar.gba`** - dumps all top candidate regions at strides 0x10-0x28 so we can manually inspect which stride yields clean enemy-stat-like records.
+3. Paste the **console output** from the v3 run - it directly identifies the enemy table region, stride, and field offsets.
 
 ---
 
@@ -119,7 +172,11 @@ Claude's binary scan found pointer tables at `0x7FB29C` (2589 pointers), `0x7F82
 Lunar Legend GBA/
 ├── gba_extract_item_table.py    # dump item table → .bin + .csv
 ├── gba_item_randomizer.py       # randomize prices + stats, patch ROM (GUI + CLI)
-├── gba_scan_enemy_table.py       # scan ROM for enemy stat table candidates
+├── gba_scan_enemy_table.py       # v1 blind scan (near item table) - false positives
+├── gba_scan_enemy_table_v2.py      # v2 full-ROM blind scan - false positives
+├── gba_locate_enemy_table.py       # v1 anchor search (Deathcap floods results)
+├── gba_locate_enemy_table_v3.py     # v3 focused anchor search (distinctive anchors only) <- RUN THIS
+├── gba_dump_candidates.py          # dump top candidate regions at multiple strides
 ├── gba_enemy_randomizer.py       # randomize enemy stats, patch ROM (GUI + CLI)
 ├── RESEARCH_NOTES.md             # this document
 ├── CLAUDE_NOTES.md               # Claude's original findings
@@ -137,12 +194,17 @@ python3 gba_extract_item_table.py lunar.gba --out-dir dumps
 # 2. Randomize items (prices + optional stats)
 python3 gba_item_randomizer.py --cli --rom lunar.gba --seed 42 --out lunar_rand.gba
 
-# 3. Scan for enemy table (once, to confirm offset/stride)
-python3 gba_scan_enemy_table.py lunar.gba
+# 3. Locate enemy table (v3 focused anchor search)
+python gba_locate_enemy_table_v3.py lunar.gba --dump
+#   -> prints best region + stride alignment to console
+#   -> also dumps u16 fields at each stride for manual inspection
+
+# 3b. (alternative) dump top candidate regions for manual inspection
+python gba_dump_candidates.py lunar.gba
 
 # 4. Randomize enemies (using confirmed offset/stride from step 3)
-python3 gba_enemy_randomizer.py --cli --rom lunar_rand.gba --offset 0x7FA000 \
-    --stride 0x20 --count 128 --seed 42 --out lunar_full_rand.gba
+python gba_enemy_randomizer.py --cli --rom lunar_rand.gba --offset 0x579e50 \
+    --stride 0x28 --count 128 --seed 42 --out lunar_full_rand.gba
 ```
 
 ---
@@ -153,7 +215,8 @@ These GBA tools mirror the PSX conventions established by Grok + Claude:
 - **Seed-based** reproducibility (same seed → same result)
 - **Buy = 0 records untouched** (no invented prices on padding/key items)
 - **Sell = buy // 2** (preserves the game's own economy rule on both platforms)
-- **Multiplier ranges** with sensible defaults (price ×[0.60, 1.75], stats ×[0.80, 1.35])
+- **Multiplier ranges** with sensibl
+e defaults (price ×[0.60, 1.75], stats ×[0.80, 1.35])
 - **GUI + CLI** modes (Python tkinter, matches PSX tools)
 - **CSV reports** for verification
 
@@ -161,7 +224,7 @@ These GBA tools mirror the PSX conventions established by Grok + Claude:
 
 ## Next steps (for the team)
 
-1. **Confirm enemy table:** Run `gba_scan_enemy_table.py` on the real ROM, inspect `gba_enemies_top_candidate.csv`, and lock in the offset/stride/field map.
+1. **Confirm enemy table:** Run `python gba_locate_enemy_table_v3.py lunar.gba --dump` on the real ROM. Paste the **console output** - it shows the best region, stride alignment scores, and individual anchor hit positions. The enemy table is expected in 0x559000-0x6A0000. Alternatively run `python gba_dump_candidates.py lunar.gba` and upload a few of the generated dump CSVs (especially 0x579e50 and 0x56a060 at stride 0x28).
 2. **Shop inventories:** Still open on both PSX and GBA — lists of item IDs per town/shop.
 3. **Character base stats:** The ROM source for the `0x02004AC2`-region base stats has not been located. Search for a table of 8 character blocks × 128 bytes with HP/MP/stats matching Alex lv1, Luna lv1, etc.
 4. **Text decoding:** GBA uses a custom/compressed font encoding; item/character names are not ASCII. Needed if we want to display names in the GUI.
