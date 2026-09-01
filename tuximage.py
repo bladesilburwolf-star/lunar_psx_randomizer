@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-tuximage.py – ISO 9660 image viewer / extractor / injector for Linux
+tuximage.py – Disc image file browser / injector (CDmage-style for Linux)
 
-Pure Python 3 + optional tkinter. Companion to bincue_gui.py:
-  bincue  → open CUE, extract/replace whole tracks
-  tuximage → open the extracted .iso, list / extract / inject files
+Open a CUE once, list files inside the data track, replace one file in-place
+in the BIN. No extract-to-ISO / rewrite-track round trip (that double-handled
+sectors and broke boots).
 
-Typical Lunar / PSX flow:
-  1. bincue_gui  – Extract data track → track01.iso
-  2. tuximage    – Inject patched SLUS_006.28 into track01.iso
-  3. bincue_gui  – Replace Selected track with the same track01.iso
+  python3 tuximage.py                  # GUI
+  python3 tuximage.py list  game.cue
+  python3 tuximage.py inject game.cue SLUS_006.28 patched.bin
 
-Same-size inject only (ISO directory size is not rewritten).
+Also opens plain 2048-byte/sector .iso files if you already have one.
 """
 
 from __future__ import annotations
@@ -19,37 +18,194 @@ from __future__ import annotations
 import struct
 import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
+
     HAS_TK = True
 except ImportError:
     HAS_TK = False
     tk = None  # type: ignore
 
+# Optional: reuse CUE parser from companion tool
+try:
+    from bincue_gui import parse_cue, Track, CueSheet
+except ImportError:
+    parse_cue = None  # type: ignore
+    Track = None  # type: ignore
+    CueSheet = None  # type: ignore
 
-SECTOR = 2048
+USER_SECTOR = 2048
 
 
 # ---------------------------------------------------------------------------
-# ISO 9660 core
+# Sector mapping – read/write 2048-byte logical sectors through a raw track
 # ---------------------------------------------------------------------------
 
-def find_pvd(iso: bytes) -> int:
-    """Byte offset of Primary Volume Descriptor."""
-    limit = min(32, len(iso) // SECTOR)
-    for s in range(16, limit):
-        off = s * SECTOR
-        if off + 6 <= len(iso) and iso[off] == 1 and iso[off + 1 : off + 6] == b"CD001":
-            return off
+@dataclass
+class DiscBackend:
+    """Abstract view of a 2048-byte/sector filesystem image."""
+
+    label: str
+
+    def size_bytes(self) -> int:
+        raise NotImplementedError
+
+    def read_logical(self, lba: int, n_sectors: int = 1) -> bytes:
+        raise NotImplementedError
+
+    def write_logical(self, lba: int, data: bytes) -> None:
+        raise NotImplementedError
+
+    def flush(self) -> None:
+        pass
+
+
+@dataclass
+class IsoFileBackend(DiscBackend):
+    """Plain .iso (already 2048 user data per sector)."""
+
+    path: Path
+    data: bytearray
+    dirty: bool = False
+
+    def size_bytes(self) -> int:
+        return len(self.data)
+
+    def read_logical(self, lba: int, n_sectors: int = 1) -> bytes:
+        start = lba * USER_SECTOR
+        end = start + n_sectors * USER_SECTOR
+        return bytes(self.data[start:end])
+
+    def write_logical(self, lba: int, data: bytes) -> None:
+        start = lba * USER_SECTOR
+        end = start + len(data)
+        if end > len(self.data):
+            raise ValueError("Write past end of ISO")
+        self.data[start:end] = data
+        self.dirty = True
+
+    def flush(self) -> None:
+        if self.dirty:
+            self.path.write_bytes(self.data)
+            self.dirty = False
+
+
+@dataclass
+class CueTrackBackend(DiscBackend):
+    """
+    Data track inside a BIN referenced by a CUE.
+
+    Logical LBA 0 = first sector of the track (INDEX 01).
+    Reads/writes only the user-data field of each 2352/2048 sector so
+    sync/header/EDC stay untouched (same idea as CDmage file replace).
+    """
+
+    bin_path: Path
+    track_file_offset_sectors: int  # where track starts in BIN
+    track_length_sectors: int
+    sector_size: int  # 2352 or 2048
+    user_offset: int  # 16 MODE1/2352, 24 MODE2/2352, 0 for 2048
+    user_size: int = USER_SECTOR
+    mode: str = ""
+    dirty: bool = False
+
+    def size_bytes(self) -> int:
+        return self.track_length_sectors * self.user_size
+
+    def _bin_byte(self, logical_lba: int) -> int:
+        return (self.track_file_offset_sectors + logical_lba) * self.sector_size + self.user_offset
+
+    def read_logical(self, lba: int, n_sectors: int = 1) -> bytes:
+        if lba < 0 or lba + n_sectors > self.track_length_sectors:
+            raise ValueError(f"LBA {lba}+{n_sectors} outside track")
+        out = bytearray()
+        with open(self.bin_path, "rb") as f:
+            for i in range(n_sectors):
+                f.seek(self._bin_byte(lba + i))
+                chunk = f.read(self.user_size)
+                if len(chunk) < self.user_size:
+                    chunk = chunk + b"\x00" * (self.user_size - len(chunk))
+                out.extend(chunk)
+        return bytes(out)
+
+    def write_logical(self, lba: int, data: bytes) -> None:
+        if len(data) % self.user_size != 0:
+            # pad last sector
+            pad = self.user_size - (len(data) % self.user_size)
+            if pad != self.user_size:
+                data = data + b"\x00" * pad
+        n = len(data) // self.user_size
+        if lba < 0 or lba + n > self.track_length_sectors:
+            raise ValueError(f"Write LBA {lba}+{n} outside track ({self.track_length_sectors})")
+        with open(self.bin_path, "r+b") as f:
+            for i in range(n):
+                f.seek(self._bin_byte(lba + i))
+                f.write(data[i * self.user_size : (i + 1) * self.user_size])
+        self.dirty = True
+
+    def flush(self) -> None:
+        # writes are direct to BIN; nothing buffered
+        self.dirty = False
+
+
+def backend_from_cue(cue_path: Path, track_number: Optional[int] = None) -> CueTrackBackend:
+    if parse_cue is None:
+        raise RuntimeError("bincue_gui.py not found – place it next to tuximage.py")
+    sheet = parse_cue(cue_path)
+    data_tracks = [t for t in sheet.tracks if not t.is_audio]
+    if not data_tracks:
+        raise ValueError("No data track in CUE")
+    if track_number is None:
+        track = data_tracks[0]
+    else:
+        track = next((t for t in sheet.tracks if t.number == track_number), None)
+        if track is None or track.is_audio:
+            raise ValueError(f"Data track {track_number} not found")
+    if not track.file_path or not track.file_path.is_file():
+        raise FileNotFoundError(f"BIN not found: {track.file_path}")
+    return CueTrackBackend(
+        label=f"{cue_path.name}  track {track.number:02d} ({track.mode})",
+        bin_path=track.file_path,
+        track_file_offset_sectors=track.file_offset_sectors,
+        track_length_sectors=track.length_sectors,
+        sector_size=track.sector_size,
+        user_offset=track.user_data_offset,
+        user_size=track.user_data_size if track.user_data_size else USER_SECTOR,
+        mode=track.mode,
+    )
+
+
+def backend_from_iso(iso_path: Path) -> IsoFileBackend:
+    data = bytearray(iso_path.read_bytes())
+    return IsoFileBackend(label=str(iso_path), path=iso_path, data=data)
+
+
+# ---------------------------------------------------------------------------
+# ISO 9660 over a DiscBackend (logical 2048-byte sectors)
+# ---------------------------------------------------------------------------
+
+def _read_range(backend: DiscBackend, lba: int, size: int) -> bytes:
+    n = (size + USER_SECTOR - 1) // USER_SECTOR
+    blob = backend.read_logical(lba, n)
+    return blob[:size]
+
+
+def find_pvd_backend(backend: DiscBackend) -> int:
+    """Return logical LBA of PVD."""
+    for s in range(16, 32):
+        sec = backend.read_logical(s, 1)
+        if len(sec) >= 6 and sec[0] == 1 and sec[1:6] == b"CD001":
+            return s
     raise ValueError("ISO 9660 Primary Volume Descriptor not found")
 
 
-def _walk_dir(
-    iso: bytes,
+def _walk_dir_backend(
+    backend: DiscBackend,
     extent_lba: int,
     size: int,
     *,
@@ -57,50 +213,37 @@ def _walk_dir(
     path_prefix: str = "",
     max_depth: int = 8,
     depth: int = 0,
-    results: Optional[List[Tuple[str, int, int, bool, int]]] = None,
-) -> Optional[Tuple[int, int, int]]:
-    """
-    Walk directory records.
-    If target_upper is set, return (lba, size, dirent_offset) on match.
-    Otherwise append (path, lba, size, is_dir, dirent_offset) to results.
-    """
+    results: Optional[List[Tuple[str, int, int, bool]]] = None,
+) -> Optional[Tuple[int, int]]:
     if results is None:
         results = []
     if depth > max_depth:
         return None
 
-    start = extent_lba * SECTOR
-    end = min(start + size, len(iso))
-    pos = start
-
-    while pos < end:
-        if pos >= len(iso):
-            break
-        length = iso[pos]
+    data = _read_range(backend, extent_lba, size)
+    pos = 0
+    while pos < len(data):
+        length = data[pos]
         if length == 0:
-            pos = ((pos // SECTOR) + 1) * SECTOR
+            pos = ((pos // USER_SECTOR) + 1) * USER_SECTOR
             continue
-        if pos + length > len(iso):
+        if pos + length > len(data):
             break
-
-        flags = iso[pos + 25]
-        loc = struct.unpack_from("<I", iso, pos + 2)[0]
-        datalen = struct.unpack_from("<I", iso, pos + 10)[0]
-        name_len = iso[pos + 32]
-        raw = iso[pos + 33 : pos + 33 + name_len]
-
+        flags = data[pos + 25]
+        loc = struct.unpack_from("<I", data, pos + 2)[0]
+        datalen = struct.unpack_from("<I", data, pos + 10)[0]
+        name_len = data[pos + 32]
+        raw = data[pos + 33 : pos + 33 + name_len]
         if raw in (b"\x00", b"\x01"):
             pos += length
             continue
-
         name = raw.split(b";")[0].decode("ascii", errors="replace")
         is_dir = bool(flags & 0x02)
         path = f"{path_prefix}{name}"
-
         if is_dir:
-            results.append((path + "/", loc, datalen, True, pos))
-            found = _walk_dir(
-                iso, loc, datalen,
+            results.append((path + "/", loc, datalen, True))
+            found = _walk_dir_backend(
+                backend, loc, datalen,
                 target_upper=target_upper,
                 path_prefix=path + "/",
                 max_depth=max_depth,
@@ -110,101 +253,85 @@ def _walk_dir(
             if found is not None:
                 return found
         else:
-            results.append((path, loc, datalen, False, pos))
-            if target_upper is not None:
-                if name.upper() == target_upper or path.upper() == target_upper:
-                    return (loc, datalen, pos)
-
+            results.append((path, loc, datalen, False))
+            if target_upper and (
+                name.upper() == target_upper or path.upper() == target_upper
+            ):
+                return (loc, datalen)
         pos += length
-
     return None
 
 
-def list_files(iso: bytes, max_depth: int = 8) -> List[Tuple[str, int, int, bool]]:
-    """Return [(path, lba, size, is_dir), ...]"""
-    pvd = find_pvd(iso)
-    root_extent = struct.unpack_from("<I", iso, pvd + 158)[0]
-    root_size = struct.unpack_from("<I", iso, pvd + 166)[0]
-    bag: List[Tuple[str, int, int, bool, int]] = []
-    _walk_dir(iso, root_extent, root_size, max_depth=max_depth, results=bag)
-    return [(p, lba, sz, d) for p, lba, sz, d, _ in bag]
+def list_files(backend: DiscBackend, max_depth: int = 8) -> List[Tuple[str, int, int, bool]]:
+    pvd_lba = find_pvd_backend(backend)
+    pvd = backend.read_logical(pvd_lba, 1)
+    root_extent = struct.unpack_from("<I", pvd, 158)[0]
+    root_size = struct.unpack_from("<I", pvd, 166)[0]
+    results: List[Tuple[str, int, int, bool]] = []
+    _walk_dir_backend(backend, root_extent, root_size, max_depth=max_depth, results=results)
+    return results
 
 
-def find_file(iso: bytes, filename: str) -> Tuple[int, int, int]:
-    """
-    Locate filename (e.g. 'SLUS_006.28').
-    Returns (lba, size_bytes, dirent_byte_offset).
-    """
-    pvd = find_pvd(iso)
-    root_extent = struct.unpack_from("<I", iso, pvd + 158)[0]
-    root_size = struct.unpack_from("<I", iso, pvd + 166)[0]
+def find_file(backend: DiscBackend, filename: str) -> Tuple[int, int]:
+    pvd_lba = find_pvd_backend(backend)
+    pvd = backend.read_logical(pvd_lba, 1)
+    root_extent = struct.unpack_from("<I", pvd, 158)[0]
+    root_size = struct.unpack_from("<I", pvd, 166)[0]
     target = filename.upper().lstrip("/")
-    bag: List = []
-    found = _walk_dir(
-        iso, root_extent, root_size, target_upper=target, results=bag
+    results: List[Tuple[str, int, int, bool]] = []
+    found = _walk_dir_backend(
+        backend, root_extent, root_size, target_upper=target, results=results
     )
-    if found is None:
-        # try basename match from full listing
-        for path, lba, sz, is_dir, dirent in bag:
-            if is_dir:
-                continue
-            base = path.rstrip("/").split("/")[-1].upper()
-            if base == target or path.upper() == target:
-                return lba, sz, dirent
-        raise FileNotFoundError(f"{filename!r} not found in ISO")
-    return found
+    if found is not None:
+        return found
+    for path, lba, sz, is_dir in results:
+        if is_dir:
+            continue
+        if path.rstrip("/").split("/")[-1].upper() == target:
+            return lba, sz
+    raise FileNotFoundError(f"{filename!r} not found on disc")
 
 
-def extract_file(iso: bytes, filename: str) -> bytes:
-    lba, size, _ = find_file(iso, filename)
-    start = lba * SECTOR
-    return iso[start : start + size]
+def extract_file(backend: DiscBackend, filename: str) -> bytes:
+    lba, size = find_file(backend, filename)
+    return _read_range(backend, lba, size)
 
 
 def replace_file(
-    iso: bytearray,
+    backend: DiscBackend,
     filename: str,
     new_data: bytes,
     *,
     must_fit: bool = True,
 ) -> dict:
-    """
-    Overwrite file extent in-place. Pads with zeros if shorter.
-    Raises if longer and must_fit=True (directory record size is not updated).
-    """
-    lba, size, dirent = find_file(bytes(iso), filename)
+    """Overwrite file extent in-place (user data only). Same size or pad."""
+    lba, size = find_file(backend, filename)
     if len(new_data) > size and must_fit:
         raise ValueError(
             f"{filename} is {size:,} bytes on disc; replacement is "
-            f"{len(new_data):,} bytes. Keep the same size (pad if needed)."
+            f"{len(new_data):,} bytes. Keep the same size."
         )
     payload = new_data[:size].ljust(size, b"\x00")
-    start = lba * SECTOR
-    end = start + size
-    if end > len(iso):
-        raise ValueError("File extent past end of image")
-    iso[start:end] = payload
+    backend.write_logical(lba, payload)
     return {
         "file": filename,
         "lba": lba,
         "original_size": size,
         "written": len(payload),
-        "dirent_offset": dirent,
     }
 
 
-def volume_info(iso: bytes) -> dict:
-    pvd = find_pvd(iso)
-    vol_space = struct.unpack_from("<I", iso, pvd + 80)[0]
-    block_size = struct.unpack_from("<H", iso, pvd + 128)[0]
-    vol_name = iso[pvd + 40 : pvd + 72].decode("ascii", errors="replace").strip()
+def volume_info(backend: DiscBackend) -> dict:
+    pvd_lba = find_pvd_backend(backend)
+    pvd = backend.read_logical(pvd_lba, 1)
+    vol_space = struct.unpack_from("<I", pvd, 80)[0]
+    vol_name = pvd[40:72].decode("ascii", errors="replace").strip()
     return {
-        "pvd_offset": pvd,
+        "pvd_lba": pvd_lba,
         "volume_name": vol_name,
         "volume_sectors": vol_space,
-        "block_size": block_size,
-        "image_size": len(iso),
-        "image_sectors": len(iso) // SECTOR,
+        "image_size": backend.size_bytes(),
+        "label": backend.label,
     }
 
 
@@ -217,13 +344,12 @@ if HAS_TK:
     class TuxImageApp(tk.Tk):
         def __init__(self):
             super().__init__()
-            self.title("tuximage – ISO 9660 Viewer / Injector")
-            self.geometry("900x580")
-            self.minsize(720, 420)
+            self.title("tuximage – disc file inject (CDmage-style)")
+            self.geometry("920x600")
+            self.minsize(740, 440)
 
-            self.iso_path: Optional[Path] = None
-            self.iso_data: Optional[bytearray] = None
-            self.dirty = False
+            self.backend: Optional[DiscBackend] = None
+            self.source_path: Optional[Path] = None
 
             self._build_ui()
 
@@ -231,26 +357,26 @@ if HAS_TK:
             toolbar = ttk.Frame(self, padding=6)
             toolbar.pack(side=tk.TOP, fill=tk.X)
 
+            ttk.Button(toolbar, text="Open CUE…", command=self.open_cue).pack(
+                side=tk.LEFT, padx=(0, 6)
+            )
             ttk.Button(toolbar, text="Open ISO…", command=self.open_iso).pack(
-                side=tk.LEFT, padx=(0, 6)
-            )
-            ttk.Button(toolbar, text="Save ISO", command=self.save_iso).pack(
-                side=tk.LEFT, padx=(0, 6)
-            )
-            ttk.Button(toolbar, text="Save ISO As…", command=self.save_iso_as).pack(
                 side=tk.LEFT, padx=(0, 12)
             )
+            ttk.Button(toolbar, text="Save", command=self.save).pack(
+                side=tk.LEFT, padx=(0, 6)
+            )
 
-            self.path_label = ttk.Label(toolbar, text="No image loaded", foreground="#555")
+            self.path_label = ttk.Label(
+                toolbar, text="Open a .cue (preferred) or .iso", foreground="#555"
+            )
             self.path_label.pack(side=tk.LEFT, padx=8)
 
-            # Info bar
             info = ttk.Frame(self, padding=(8, 0))
             info.pack(side=tk.TOP, fill=tk.X)
             self.info_label = ttk.Label(info, text="")
             self.info_label.pack(side=tk.LEFT)
 
-            # File list
             list_frame = ttk.Frame(self, padding=6)
             list_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -262,7 +388,7 @@ if HAS_TK:
             self.tree.heading("lba", text="LBA")
             self.tree.heading("size", text="Size")
             self.tree.heading("kind", text="Type")
-            self.tree.column("path", width=420)
+            self.tree.column("path", width=440)
             self.tree.column("lba", width=90, anchor=tk.E)
             self.tree.column("size", width=110, anchor=tk.E)
             self.tree.column("kind", width=70, anchor=tk.CENTER)
@@ -272,29 +398,24 @@ if HAS_TK:
             self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-            # Actions
             bottom = ttk.Frame(self, padding=6)
             bottom.pack(side=tk.BOTTOM, fill=tk.X)
 
-            ttk.Button(bottom, text="Extract Selected…", command=self.extract_selected).pack(
-                side=tk.LEFT, padx=(0, 6)
-            )
-            ttk.Button(bottom, text="Inject / Replace…", command=self.inject_selected).pack(
-                side=tk.LEFT, padx=(0, 6)
-            )
-            ttk.Button(bottom, text="Extract All…", command=self.extract_all).pack(
-                side=tk.LEFT, padx=(0, 12)
-            )
+            ttk.Button(
+                bottom, text="Extract Selected…", command=self.extract_selected
+            ).pack(side=tk.LEFT, padx=(0, 6))
+            ttk.Button(
+                bottom, text="Replace Selected…", command=self.replace_selected
+            ).pack(side=tk.LEFT, padx=(0, 12))
 
-            self.progress = ttk.Progressbar(bottom, mode="determinate", length=180)
-            self.progress.pack(side=tk.LEFT, padx=8)
-
-            self.status = ttk.Label(bottom, text="Open an ISO extracted from bincue_gui")
+            self.status = ttk.Label(
+                bottom, text="CUE → pick file → Replace → done (writes BIN directly)"
+            )
             self.status.pack(side=tk.LEFT, padx=8)
 
             log_frame = ttk.LabelFrame(self, text="Log", padding=4)
             log_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=4)
-            self.log = tk.Text(log_frame, height=4, wrap=tk.WORD, state=tk.DISABLED)
+            self.log = tk.Text(log_frame, height=5, wrap=tk.WORD, state=tk.DISABLED)
             self.log.pack(fill=tk.X)
 
         def log_msg(self, msg: str):
@@ -303,52 +424,28 @@ if HAS_TK:
             self.log.see(tk.END)
             self.log.configure(state=tk.DISABLED)
 
-        def open_iso(self):
-            if self.dirty:
-                if not messagebox.askyesno(
-                    "Unsaved changes",
-                    "Image was modified. Discard changes and open another?",
-                ):
-                    return
-            path = filedialog.askopenfilename(
-                title="Open ISO image",
-                filetypes=[
-                    ("ISO images", "*.iso *.img *.bin"),
-                    ("All files", "*.*"),
-                ],
-            )
-            if not path:
-                return
-            path = Path(path)
+        def _load_backend(self, backend: DiscBackend, source: Path):
             try:
-                data = bytearray(path.read_bytes())
-                info = volume_info(bytes(data))
-                files = list_files(bytes(data))
+                info = volume_info(backend)
+                files = list_files(backend)
             except Exception as e:
                 messagebox.showerror("Open failed", str(e))
                 self.log_msg(f"ERROR: {e}")
                 return
-
-            self.iso_path = path
-            self.iso_data = data
-            self.dirty = False
-            self.path_label.configure(text=str(path))
+            self.backend = backend
+            self.source_path = source
+            self.path_label.configure(text=backend.label)
+            nfiles = sum(1 for f in files if not f[3])
             self.info_label.configure(
                 text=(
                     f"Volume: {info['volume_name'] or '(none)'}  |  "
-                    f"{info['volume_sectors']} sectors (PVD)  |  "
-                    f"image {info['image_size']:,} bytes  |  "
-                    f"{sum(1 for f in files if not f[3])} files"
+                    f"PVD LBA {info['pvd_lba']}  |  "
+                    f"{info['volume_sectors']} vol sectors  |  "
+                    f"{nfiles} files"
                 )
             )
-            self._populate(files)
-            self.status.configure(text=f"Loaded {path.name}")
-            self.log_msg(f"Opened {path} ({info['image_size']:,} bytes)")
-
-        def _populate(self, files: List[Tuple[str, int, int, bool]]):
             self.tree.delete(*self.tree.get_children())
             for path, lba, size, is_dir in files:
-                kind = "DIR" if is_dir else "FILE"
                 self.tree.insert(
                     "",
                     tk.END,
@@ -356,27 +453,74 @@ if HAS_TK:
                     values=(
                         path,
                         lba,
-                        f"{size:,}" if not is_dir else "—",
-                        kind,
+                        "—" if is_dir else f"{size:,}",
+                        "DIR" if is_dir else "FILE",
                     ),
                 )
+            self.status.configure(text=f"Loaded – {nfiles} files")
+            self.log_msg(f"Opened {backend.label}")
+
+        def open_cue(self):
+            if parse_cue is None:
+                messagebox.showerror(
+                    "Missing bincue_gui",
+                    "tuximage needs bincue_gui.py in the same folder\n"
+                    "to parse CUE sheets.",
+                )
+                return
+            path = filedialog.askopenfilename(
+                title="Open CUE sheet",
+                filetypes=[("CUE sheets", "*.cue"), ("All files", "*.*")],
+            )
+            if not path:
+                return
+            path = Path(path)
+            try:
+                backend = backend_from_cue(path)
+            except Exception as e:
+                messagebox.showerror("CUE open failed", str(e))
+                self.log_msg(f"ERROR: {e}")
+                return
+            self._load_backend(backend, path)
+            self.log_msg(
+                f"Data track → {backend.bin_path.name}  "
+                f"mode={backend.mode}  sectors={backend.track_length_sectors}  "
+                f"user_off={backend.user_offset}"
+            )
+
+        def open_iso(self):
+            path = filedialog.askopenfilename(
+                title="Open ISO (2048-byte sectors)",
+                filetypes=[
+                    ("ISO images", "*.iso *.img"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if not path:
+                return
+            path = Path(path)
+            try:
+                backend = backend_from_iso(path)
+            except Exception as e:
+                messagebox.showerror("ISO open failed", str(e))
+                return
+            self._load_backend(backend, path)
 
         def _selected_files(self) -> List[str]:
-            sel = self.tree.selection()
             out = []
-            for iid in sel:
+            for iid in self.tree.selection():
                 vals = self.tree.item(iid, "values")
                 if vals and vals[3] == "FILE":
                     out.append(vals[0])
             return out
 
         def extract_selected(self):
-            if not self.iso_data:
-                messagebox.showinfo("No ISO", "Open an ISO first.")
+            if not self.backend:
+                messagebox.showinfo("No disc", "Open a CUE or ISO first.")
                 return
             names = self._selected_files()
             if not names:
-                messagebox.showinfo("Select", "Select one or more files (not directories).")
+                messagebox.showinfo("Select", "Select one or more files.")
                 return
             out_dir = filedialog.askdirectory(title="Extract to folder")
             if not out_dir:
@@ -385,180 +529,123 @@ if HAS_TK:
             ok = 0
             for name in names:
                 try:
-                    data = extract_file(bytes(self.iso_data), name)
+                    data = extract_file(self.backend, name)
                     dest = out_dir / Path(name).name
                     dest.write_bytes(data)
-                    self.log_msg(f"Extracted {name} → {dest.name} ({len(data):,} bytes)")
+                    self.log_msg(f"Extracted {name} ({len(data):,} bytes)")
                     ok += 1
                 except Exception as e:
                     self.log_msg(f"ERROR {name}: {e}")
-            self.status.configure(text=f"Extracted {ok} file(s)")
             messagebox.showinfo("Done", f"Extracted {ok} file(s) to\n{out_dir}")
 
-        def extract_all(self):
-            if not self.iso_data:
-                messagebox.showinfo("No ISO", "Open an ISO first.")
-                return
-            out_dir = filedialog.askdirectory(title="Extract all files to folder")
-            if not out_dir:
-                return
-            out_dir = Path(out_dir)
-
-            def worker():
-                files = [f for f in list_files(bytes(self.iso_data)) if not f[3]]
-                total = len(files)
-                for i, (name, lba, size, _) in enumerate(files):
-                    try:
-                        data = extract_file(bytes(self.iso_data), name)
-                        # preserve relative path under out_dir
-                        dest = out_dir / name
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        dest.write_bytes(data)
-                        self.after(
-                            0,
-                            lambda n=name, d=len(data), i=i: (
-                                self.log_msg(f"Extracted {n} ({d:,} bytes)"),
-                                self.progress.configure(
-                                    value=int(100 * (i + 1) / total)
-                                ),
-                            ),
-                        )
-                    except Exception as e:
-                        self.after(
-                            0, lambda n=name, e=e: self.log_msg(f"ERROR {n}: {e}")
-                        )
-                self.after(
-                    0,
-                    lambda: (
-                        self.progress.configure(value=0),
-                        self.status.configure(text=f"Extracted {total} files"),
-                        messagebox.showinfo(
-                            "Done", f"Extracted {total} files to\n{out_dir}"
-                        ),
-                    ),
-                )
-
-            self.status.configure(text="Extracting…")
-            threading.Thread(target=worker, daemon=True).start()
-
-        def inject_selected(self):
-            if not self.iso_data:
-                messagebox.showinfo("No ISO", "Open an ISO first.")
+        def replace_selected(self):
+            if not self.backend:
+                messagebox.showinfo("No disc", "Open a CUE or ISO first.")
                 return
             names = self._selected_files()
             if len(names) != 1:
-                messagebox.showinfo(
-                    "Select one file",
-                    "Select exactly one file in the list to replace.",
-                )
+                messagebox.showinfo("Select one", "Select exactly one file to replace.")
                 return
             target = names[0]
             try:
-                _, orig_size, _ = find_file(bytes(self.iso_data), target)
+                _, orig_size = find_file(self.backend, target)
             except Exception as e:
                 messagebox.showerror("Error", str(e))
                 return
 
             repl = filedialog.askopenfilename(
                 title=f"Replacement for {target} ({orig_size:,} bytes on disc)",
-                filetypes=[("All files", "*.*")],
             )
             if not repl:
                 return
             repl_path = Path(repl)
             data = repl_path.read_bytes()
 
-            msg = (
-                f"Replace  {target}\n"
-                f"  on-disc size : {orig_size:,} bytes\n"
-                f"  replacement  : {len(data):,} bytes\n\n"
-            )
             if len(data) > orig_size:
-                msg += "ERROR: replacement is larger – cannot inject.\n"
-                messagebox.showerror("Too large", msg)
+                messagebox.showerror(
+                    "Too large",
+                    f"On disc: {orig_size:,} bytes\n"
+                    f"Replacement: {len(data):,} bytes\n\n"
+                    "File must be the same size or smaller.",
+                )
                 return
+
+            msg = (
+                f"Replace {target} on disc\n"
+                f"  size on disc : {orig_size:,}\n"
+                f"  replacement  : {len(data):,}\n\n"
+            )
+            if isinstance(self.backend, CueTrackBackend):
+                msg += f"Writes directly into:\n  {self.backend.bin_path}\n\n"
             if len(data) < orig_size:
-                msg += "Replacement is smaller; will zero-pad to original size.\n\n"
-            msg += "Modify the image in memory? (use Save ISO when done)"
-            if not messagebox.askyesno("Confirm inject", msg):
+                msg += "Shorter file will be zero-padded.\n\n"
+            msg += "Continue?"
+            if not messagebox.askyesno("Confirm replace", msg):
                 return
 
             try:
-                summary = replace_file(self.iso_data, target, data, must_fit=True)
-                self.dirty = True
+                summary = replace_file(self.backend, target, data, must_fit=True)
+                self.backend.flush()
                 self.log_msg(
-                    f"Injected {repl_path.name} → {target} "
-                    f"(LBA {summary['lba']}, {summary['written']:,} bytes)"
+                    f"Replaced {target}  LBA={summary['lba']}  "
+                    f"wrote {summary['written']:,} bytes"
                 )
-                self.status.configure(text=f"Injected {target} (unsaved)")
-                self.path_label.configure(
-                    text=f"{self.iso_path}  [modified]"
-                )
+                if isinstance(self.backend, CueTrackBackend):
+                    self.log_msg(f"BIN updated: {self.backend.bin_path}")
+                    self.status.configure(text="Done – BIN written (boot the CUE)")
+                else:
+                    self.status.configure(text="Done – ISO updated in memory, Save if needed")
                 messagebox.showinfo(
-                    "Injected",
-                    f"Replaced {target} in memory.\n\n"
-                    f"LBA {summary['lba']}  wrote {summary['written']:,} bytes\n\n"
-                    "Click Save ISO, then use bincue_gui → Replace Selected\n"
-                    "to write this ISO back into the BIN.",
+                    "Replaced",
+                    f"{target} updated.\n"
+                    f"LBA {summary['lba']}  {summary['written']:,} bytes\n\n"
+                    + (
+                        f"BIN:\n{self.backend.bin_path}\n\nBoot the original CUE."
+                        if isinstance(self.backend, CueTrackBackend)
+                        else "Use Save if this is a standalone ISO."
+                    ),
                 )
             except Exception as e:
-                messagebox.showerror("Inject failed", str(e))
-                self.log_msg(f"ERROR inject: {e}")
+                messagebox.showerror("Replace failed", str(e))
+                self.log_msg(f"ERROR: {e}")
 
-        def save_iso(self):
-            if not self.iso_data or not self.iso_path:
-                messagebox.showinfo("Nothing", "No image loaded.")
+        def save(self):
+            if not self.backend:
                 return
-            if not self.dirty:
-                messagebox.showinfo("No changes", "Image was not modified.")
-                return
-            self.iso_path.write_bytes(self.iso_data)
-            self.dirty = False
-            self.path_label.configure(text=str(self.iso_path))
-            self.log_msg(f"Saved {self.iso_path}")
-            self.status.configure(text="Saved")
-            messagebox.showinfo("Saved", f"Wrote\n{self.iso_path}")
-
-        def save_iso_as(self):
-            if not self.iso_data:
-                messagebox.showinfo("Nothing", "No image loaded.")
-                return
-            path = filedialog.asksaveasfilename(
-                title="Save ISO as",
-                defaultextension=".iso",
-                filetypes=[("ISO images", "*.iso"), ("All files", "*.*")],
-            )
-            if not path:
-                return
-            path = Path(path)
-            path.write_bytes(self.iso_data)
-            self.iso_path = path
-            self.dirty = False
-            self.path_label.configure(text=str(path))
-            self.log_msg(f"Saved as {path}")
-            self.status.configure(text="Saved")
+            if isinstance(self.backend, IsoFileBackend):
+                if not self.backend.dirty:
+                    messagebox.showinfo("No changes", "Nothing to save.")
+                    return
+                self.backend.flush()
+                self.log_msg(f"Saved {self.backend.path}")
+                messagebox.showinfo("Saved", str(self.backend.path))
+            else:
+                # CUE backend already wrote through to BIN
+                messagebox.showinfo(
+                    "Already on disc",
+                    "CUE mode writes the BIN immediately on Replace.\n"
+                    "Nothing extra to save.",
+                )
 
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
         print(__doc__)
-        print("Usage:")
-        print("  python3 tuximage.py                  # GUI")
-        print("  python3 tuximage.py list  file.iso")
-        print("  python3 tuximage.py extract file.iso SLUS_006.28 -o SLUS_006.28")
-        print("  python3 tuximage.py inject  file.iso SLUS_006.28 patched.bin")
         return
 
-    # CLI mode
     if len(sys.argv) >= 3:
         cmd = sys.argv[1].lower()
-        iso_path = Path(sys.argv[2])
-        data = bytearray(iso_path.read_bytes())
+        src = Path(sys.argv[2])
+        if src.suffix.lower() == ".cue":
+            backend = backend_from_cue(src)
+        else:
+            backend = backend_from_iso(src)
 
         if cmd == "list":
-            info = volume_info(bytes(data))
+            info = volume_info(backend)
+            print(f"{info['label']}")
             print(f"Volume: {info['volume_name']!r}  sectors={info['volume_sectors']}")
-            for path, lba, size, is_dir in list_files(bytes(data)):
+            for path, lba, size, is_dir in list_files(backend):
                 kind = "DIR " if is_dir else "FILE"
                 print(f"  {kind}  LBA={lba:6d}  {size:10,}  {path}")
             return
@@ -566,7 +653,7 @@ def main():
         if cmd == "extract" and len(sys.argv) >= 4:
             name = sys.argv[3]
             out = Path(sys.argv[sys.argv.index("-o") + 1]) if "-o" in sys.argv else Path(name).name
-            blob = extract_file(bytes(data), name)
+            blob = extract_file(backend, name)
             out.write_bytes(blob)
             print(f"Wrote {out} ({len(blob):,} bytes)")
             return
@@ -574,12 +661,14 @@ def main():
         if cmd == "inject" and len(sys.argv) >= 5:
             name = sys.argv[3]
             repl = Path(sys.argv[4]).read_bytes()
-            summary = replace_file(data, name, repl, must_fit=True)
-            iso_path.write_bytes(data)
+            summary = replace_file(backend, name, repl, must_fit=True)
+            backend.flush()
             print(
-                f"Injected {name}: LBA {summary['lba']}, "
-                f"{summary['written']:,} / {summary['original_size']:,} bytes → {iso_path}"
+                f"Replaced {name}: LBA {summary['lba']}, "
+                f"{summary['written']:,}/{summary['original_size']:,} bytes"
             )
+            if isinstance(backend, CueTrackBackend):
+                print(f"BIN: {backend.bin_path}")
             return
 
         print("Unknown command. Use --help.")
@@ -587,7 +676,6 @@ def main():
 
     if not HAS_TK:
         print("ERROR: tkinter not available (sudo apt install python3-tk)")
-        print("CLI still works: python3 tuximage.py list file.iso")
         sys.exit(1)
 
     app = TuxImageApp()
