@@ -1,0 +1,61 @@
+================================================================================
+DEPRECATED TOOLS — DO NOT USE
+================================================================================
+
+The following tools are marked DEPRECATED because they produce excessive false
+positives and/or consume extreme system resources. Do not use them.
+
+DEPRECATED:
+  ❌ gba_mixed_template_search.py
+     Reason: Combines u8 + u16 methods; cross-contamination produces 1000+
+             false candidates per run. Worst false positive rate.
+     Use instead: gba_exact_anchor_search.py (optimized version in T3.1)
+
+  ❌ gba_table_stride_search.py
+     Reason: Pattern-matching without domain knowledge. Produces 10,000+
+             false candidates; resource explosion. Pure noise.
+     Use instead: gba_template_search.py (with stride pre-filtering in T3.2)
+
+  ❌ gba_u8_anchor_search.py
+     Reason: Byte values (15, 30, 40) appear 500-1000x in 8MB binary data
+             as padding, text, alignment. Zero signal/noise discrimination.
+     Use instead: gba_exact_anchor_search.py only
+
+  ⚠️  gba_locate_enemy_table_v3.py
+     Status: UNDER REDESIGN
+     Issue: Runs all sub-methods without cross-validation. Merges results
+            by score, but score doesn't distinguish real tables from noise.
+     Action: Redesign in progress (see OPTIMIZATION_ROADMAP.md, Tier 2)
+
+================================================================================
+RECOMMENDED TOOLS
+================================================================================
+
+✅ gba_exact_anchor_search.py
+   Status: Optimized version in progress (Tier 3.1)
+   Use: Primary enemy table search
+   Note: Tight window (16 bytes) reduces false positives vs template_search
+
+✅ gba_template_search.py
+   Status: Optimization in progress (Tier 3.2)
+   Use: Secondary validation / alternative method
+   Note: Will pre-filter strides (59 → 5-7)
+
+✅ gba_item_randomizer.py
+   Status: PRODUCTION READY
+   Use: Apply randomization to items (offset is fixed at 0x7FA424)
+
+✅ gba_enemy_randomizer.py
+   Status: PRODUCTION READY
+   Use: Apply randomization to enemies (requires manual offset/stride input)
+
+================================================================================
+REFERENCE DOCUMENTS
+================================================================================
+
+See also:
+  - OPTIMIZATION_ROADMAP.md ← Implementation plan (Tiers 1-4)
+  - KNOWN_ANCHORS.md ← Verified anchor values for searching
+  - binary_scan_notes.md ← Previous analysis results
+
+================================================================================
