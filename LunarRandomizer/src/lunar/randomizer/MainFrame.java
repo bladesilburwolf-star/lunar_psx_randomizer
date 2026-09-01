@@ -48,13 +48,19 @@ public class MainFrame extends JFrame {
     private final RangeSliderRow defRow = new RangeSliderRow("DEF");
     private final RangeSliderRow expRow = new RangeSliderRow("EXP");
     private final RangeSliderRow silRow = new RangeSliderRow("Silver");
+    private final RangeSliderRow agiRow = new RangeSliderRow("Agility");
+    private final RangeSliderRow wisRow = new RangeSliderRow("Wisdom");
+    private final RangeSliderRow mdefRow = new RangeSliderRow("Magic Def");
     private final JCheckBox shuffleCheck = new JCheckBox("Shuffle similar-level packs");
+    private final JCheckBox shuffleIdentityCheck = new JCheckBox(
+            "Shuffle monster identity (permute FULL records across slots)");
     private final JSpinner bandSpinner = new JSpinner(new SpinnerNumberModel(3, 1, 20, 1));
 
     // Items
     private final JTextField itemInField = new JTextField(28);
     private final JTextField itemOutField = new JTextField(28);
     private final RangeSliderRow priceRow = new RangeSliderRow("Price");
+    private final RangeSliderRow itemStatRow = new RangeSliderRow("Stat (ATK/DEF)");
 
     public MainFrame() {
         super("Lunar Silver Star Story — Randomizer");
@@ -75,10 +81,16 @@ public class MainFrame extends JFrame {
         defRow.setRange(0.75, 1.40);
         expRow.setRange(0.70, 1.50);
         silRow.setRange(0.70, 1.50);
+        agiRow.setRange(0.80, 1.30);
+        wisRow.setRange(0.75, 1.40);
+        mdefRow.setRange(0.75, 1.40);
         priceRow.setRange(0.60, 1.75);
+        itemStatRow.setRange(0.75, 1.50);
 
         shuffleCheck.setOpaque(false);
         shuffleCheck.setForeground(Theme.TEXT_PRIMARY);
+        shuffleIdentityCheck.setOpaque(false);
+        shuffleIdentityCheck.setForeground(Theme.TEXT_PRIMARY);
 
         log("Ready. Load enemy_master.bin / item_master.bin, set seed & ranges, then Randomize.");
         log("After writing bins: use patch_exe.py / patch_item_exe.py (chain) and CDmage/tuximage to inject SLUS_006.28.");
@@ -191,6 +203,9 @@ public class MainFrame extends JFrame {
         ranges.add(hpRow);
         ranges.add(atkRow);
         ranges.add(defRow);
+        ranges.add(agiRow);
+        ranges.add(wisRow);
+        ranges.add(mdefRow);
         ranges.add(expRow);
         ranges.add(silRow);
         p.add(ranges);
@@ -205,6 +220,19 @@ public class MainFrame extends JFrame {
         opts.add(bandL);
         opts.add(bandSpinner);
         p.add(opts);
+        p.add(Box.createVerticalStrut(2));
+
+        JPanel opts2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
+        opts2.setOpaque(false);
+        opts2.add(shuffleIdentityCheck);
+        p.add(opts2);
+        JLabel identityNote = new JLabel(
+                "<html>Whether this changes which sprite/name shows up in a fight depends on "
+                + "the game's (unconfirmed) formation lookup &mdash; see FORMATION_NOTES.md</html>");
+        identityNote.setForeground(Theme.TEXT_MUTED);
+        identityNote.setFont(Theme.FONT_UI);
+        identityNote.setBorder(new EmptyBorder(0, 4, 0, 0));
+        p.add(identityNote);
         p.add(Box.createVerticalStrut(8));
 
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
@@ -237,6 +265,19 @@ public class MainFrame extends JFrame {
         ranges.add(Box.createVerticalStrut(4));
         ranges.add(note);
         p.add(ranges);
+        p.add(Box.createVerticalStrut(8));
+
+        JPanel statRanges = section("Stat multipliers");
+        statRanges.setLayout(new BoxLayout(statRanges, BoxLayout.Y_AXIS));
+        statRanges.add(itemStatRow);
+        JLabel statNote = new JLabel(
+                "Offset 0x0A: ATK for weapons, DEF-analog for other categories "
+                + "(confirmed vs. GBA Lunar Legend). Stat=0 items untouched.");
+        statNote.setForeground(Theme.TEXT_MUTED);
+        statNote.setFont(Theme.FONT_UI);
+        statRanges.add(Box.createVerticalStrut(4));
+        statRanges.add(statNote);
+        p.add(statRanges);
         p.add(Box.createVerticalStrut(8));
 
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
@@ -383,10 +424,17 @@ public class MainFrame extends JFrame {
             ranges.expMax = expRow.getMax();
             ranges.silverMin = silRow.getMin();
             ranges.silverMax = silRow.getMax();
+            ranges.agiMin = agiRow.getMin();
+            ranges.agiMax = agiRow.getMax();
+            ranges.wisMin = wisRow.getMin();
+            ranges.wisMax = wisRow.getMax();
+            ranges.mdefMin = mdefRow.getMin();
+            ranges.mdefMax = mdefRow.getMax();
 
             int band = ((Number) bandSpinner.getValue()).intValue();
             List<EnemyTable.Enemy> result = EnemyTable.randomize(
-                    enemies, ranges, seed, shuffleCheck.isSelected(), band);
+                    enemies, ranges, seed, shuffleCheck.isSelected(), band,
+                    shuffleIdentityCheck.isSelected());
             EnemyTable.save(out, result);
 
             int active = 0;
@@ -396,9 +444,11 @@ public class MainFrame extends JFrame {
                 }
             }
             log(String.format(
-                    "Enemies: loaded %d (%d active) → wrote %s  seed=%d  HP[%.2f–%.2f] ATK[%.2f–%.2f]",
+                    "Enemies: loaded %d (%d active) → wrote %s  seed=%d  HP[%.2f–%.2f] ATK[%.2f–%.2f]"
+                    + "  identityShuffle=%s",
                     enemies.size(), active, out.toAbsolutePath(), seed,
-                    ranges.hpMin, ranges.hpMax, ranges.atkMin, ranges.atkMax));
+                    ranges.hpMin, ranges.hpMax, ranges.atkMin, ranges.atkMax,
+                    shuffleIdentityCheck.isSelected()));
         } catch (Exception ex) {
             log("ERROR (enemies): " + ex.getMessage());
             JOptionPane.showMessageDialog(this, ex.getMessage(), "Enemy randomize",
@@ -428,19 +478,25 @@ public class MainFrame extends JFrame {
             ItemTable.Ranges ranges = new ItemTable.Ranges();
             ranges.priceMin = priceRow.getMin();
             ranges.priceMax = priceRow.getMax();
+            ranges.statMin = itemStatRow.getMin();
+            ranges.statMax = itemStatRow.getMax();
             List<ItemTable.Item> result = ItemTable.randomize(items, ranges, seed);
             ItemTable.save(out, result);
 
             int priced = 0;
+            int statted = 0;
             for (ItemTable.Item it : items) {
                 if (it.isPriced()) {
                     priced++;
                 }
+                if (it.hasStat()) {
+                    statted++;
+                }
             }
             log(String.format(
-                    "Items: loaded %d (%d priced) → wrote %s  seed=%d  price[%.2f–%.2f×]",
-                    items.size(), priced, out.toAbsolutePath(), seed,
-                    ranges.priceMin, ranges.priceMax));
+                    "Items: loaded %d (%d priced, %d w/ stat) → wrote %s  seed=%d  price[%.2f–%.2f×] stat[%.2f–%.2f×]",
+                    items.size(), priced, statted, out.toAbsolutePath(), seed,
+                    ranges.priceMin, ranges.priceMax, ranges.statMin, ranges.statMax));
         } catch (Exception ex) {
             log("ERROR (items): " + ex.getMessage());
             JOptionPane.showMessageDialog(this, ex.getMessage(), "Item randomize",

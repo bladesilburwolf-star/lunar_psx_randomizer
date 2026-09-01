@@ -22,6 +22,10 @@ public final class ItemTable {
     public static final class Item {
         public int buy;
         public int sell;
+        public int stat;   // offset 0x0A, u8. CONFIRMED: ATK for weapons /
+                            // DEF-analog for other categories. Cross-verified
+                            // 20/20 exact matches against GBA Lunar Legend's
+                            // equivalent item stat. See item_randomizer/NOTES.md.
         public final byte[] raw;
 
         public Item(byte[] record) {
@@ -32,6 +36,7 @@ public final class ItemTable {
             ByteBuffer bb = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN);
             buy = bb.getShort(0) & 0xFFFF;
             sell = bb.getShort(2) & 0xFFFF;
+            stat = raw[0x0A] & 0xFF;
         }
 
         public byte[] pack() {
@@ -39,17 +44,24 @@ public final class ItemTable {
             ByteBuffer bb = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN);
             bb.putShort(0, (short) clampU16(buy));
             bb.putShort(2, (short) clampU16(sell));
+            out[0x0A] = (byte) clampU8(stat);
             return out;
         }
 
         public boolean isPriced() {
             return buy > 0;
         }
+
+        public boolean hasStat() {
+            return stat > 0;
+        }
     }
 
     public static final class Ranges {
         public double priceMin = 0.60;
         public double priceMax = 1.75;
+        public double statMin = 0.75;
+        public double statMax = 1.50;
     }
 
     public static List<Item> load(Path path) throws IOException {
@@ -87,6 +99,11 @@ public final class ItemTable {
                 copy.buy = clampU16(newBuy);
                 copy.sell = clampU16(copy.buy / 2);
             }
+            if (copy.hasStat()) {
+                double sFactor = ranges.statMin + rng.nextDouble() * (ranges.statMax - ranges.statMin);
+                int newStat = Math.max(1, (int) Math.round(copy.stat * sFactor));
+                copy.stat = clampU8(newStat);
+            }
             result.add(copy);
         }
         return result;
@@ -98,6 +115,16 @@ public final class ItemTable {
         }
         if (v > 0xFFFF) {
             return 0xFFFF;
+        }
+        return v;
+    }
+
+    private static int clampU8(int v) {
+        if (v < 0) {
+            return 0;
+        }
+        if (v > 0xFF) {
+            return 0xFF;
         }
         return v;
     }

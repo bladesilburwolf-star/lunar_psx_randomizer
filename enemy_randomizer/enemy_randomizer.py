@@ -195,6 +195,12 @@ class StatRanges:
     exp_max: float = 1.50
     silver_min: float = 0.70
     silver_max: float = 1.50
+    agi_min: float = 0.80
+    agi_max: float = 1.30
+    wis_min: float = 0.75
+    wis_max: float = 1.40
+    mdef_min: float = 0.75
+    mdef_max: float = 1.40
     # Keep level / type / misc intact by default
 
 
@@ -211,10 +217,33 @@ def randomize_enemies(
     seed: int,
     shuffle_similar: bool = False,
     level_band: int = 3,
+    shuffle_identity: bool = False,
 ) -> List[Enemy]:
-    """Return a new list with scaled (and optionally shuffled) stats."""
+    """Return a new list with scaled (and optionally shuffled) stats.
+
+    shuffle_identity: permutes ENTIRE 38-byte records across table slots
+    (type, level, every stat -- the full monster definition), rather than
+    just swapping individual stat values among same-level enemies. This is
+    the closest thing to "shuffle which monster appears where" achievable
+    without a confirmed formation/encounter table (see FORMATION_NOTES.md
+    for the current state of that search). Whether this actually changes
+    which sprite/name shows up in a given fight depends on whether the
+    game's formation system references monsters by this table's index or
+    by some other key -- that part is NOT yet confirmed. What IS
+    guaranteed: every monster definition in the game still exists exactly
+    once, just reassigned to a different slot, so nothing is duplicated or
+    lost.
+    """
     rng = random.Random(seed)
     result = [Enemy.unpack(e.pack(), name=e.name) for e in enemies]  # deep copy
+
+    if shuffle_identity:
+        active_idxs = [i for i, e in enumerate(result) if e.hp >= 5 and e.level >= 1]
+        records = [result[i].pack() for i in active_idxs]
+        rng.shuffle(records)
+        for i, rec in zip(active_idxs, records):
+            name = result[i].name  # keep the slot's own label, not the moved-in one
+            result[i] = Enemy.unpack(rec, name=name)
 
     # 1) Scale
     for e in result:
@@ -223,6 +252,9 @@ def randomize_enemies(
         e.defense = _scale(rng, e.defense, ranges.def_min, ranges.def_max)
         e.exp = _scale(rng, e.exp, ranges.exp_min, ranges.exp_max)
         e.silver = _scale(rng, e.silver, ranges.silver_min, ranges.silver_max)
+        e.agility = _scale(rng, e.agility, ranges.agi_min, ranges.agi_max)
+        e.wisdom = _scale(rng, e.wisdom, ranges.wis_min, ranges.wis_max)
+        e.magic_defense = _scale(rng, e.magic_defense, ranges.mdef_min, ranges.mdef_max)
 
     # 2) Optional: shuffle combat stats among enemies of similar level
     if shuffle_similar and len(result) > 1:
@@ -234,24 +266,27 @@ def randomize_enemies(
         for idxs in bands.values():
             if len(idxs) < 2:
                 continue
-            # collect packs of (hp, atk, def, exp, silver)
+            # collect packs of (hp, atk, def, exp, silver, agi, wis, mdef)
             packs = [
                 (result[i].hp, result[i].attack, result[i].defense,
-                 result[i].exp, result[i].silver)
+                 result[i].exp, result[i].silver, result[i].agility,
+                 result[i].wisdom, result[i].magic_defense)
                 for i in idxs
             ]
             rng.shuffle(packs)
             for i, p in zip(idxs, packs):
                 result[i].hp, result[i].attack, result[i].defense, \
-                    result[i].exp, result[i].silver = p
+                    result[i].exp, result[i].silver, result[i].agility, \
+                    result[i].wisdom, result[i].magic_defense = p
 
     return result
 
 
 def report(original: List[Enemy], modified: List[Enemy]) -> str:
     lines = []
-    lines.append(f"{'Name':<22} {'Lv':>3}  {'HP':>8}  {'ATK':>8}  {'DEF':>8}  {'EXP':>8}  {'SIL':>8}")
-    lines.append("-" * 78)
+    lines.append(f"{'Name':<22} {'Lv':>3}  {'HP':>8}  {'ATK':>8}  {'DEF':>8}  "
+                  f"{'AGI':>8}  {'WIS':>8}  {'MDEF':>8}  {'EXP':>8}  {'SIL':>8}")
+    lines.append("-" * 108)
     for o, m in zip(original, modified):
         def fmt(a, b):
             if a == b:
@@ -260,7 +295,10 @@ def report(original: List[Enemy], modified: List[Enemy]) -> str:
         lines.append(
             f"{(m.name or o.name):<22} {m.level:3d}  "
             f"{fmt(o.hp, m.hp):>8}  {fmt(o.attack, m.attack):>8}  "
-            f"{fmt(o.defense, m.defense):>8}  {fmt(o.exp, m.exp):>8}  "
+            f"{fmt(o.defense, m.defense):>8}  "
+            f"{fmt(o.agility, m.agility):>8}  {fmt(o.wisdom, m.wisdom):>8}  "
+            f"{fmt(o.magic_defense, m.magic_defense):>8}  "
+            f"{fmt(o.exp, m.exp):>8}  "
             f"{fmt(o.silver, m.silver):>8}"
         )
     return "\n".join(lines)
@@ -284,18 +322,24 @@ def run_cli(args: argparse.Namespace) -> int:
         def_min=args.def_min, def_max=args.def_max,
         exp_min=args.exp_min, exp_max=args.exp_max,
         silver_min=args.sil_min, silver_max=args.sil_max,
+        agi_min=args.agi_min, agi_max=args.agi_max,
+        wis_min=args.wis_min, wis_max=args.wis_max,
+        mdef_min=args.mdef_min, mdef_max=args.mdef_max,
     )
     seed = args.seed if args.seed is not None else random.randint(0, 2**31 - 1)
     print(f"Seed: {seed}")
     print(f"Ranges: HP {ranges.hp_min}-{ranges.hp_max}  ATK {ranges.atk_min}-{ranges.atk_max}  "
           f"DEF {ranges.def_min}-{ranges.def_max}  EXP {ranges.exp_min}-{ranges.exp_max}  "
-          f"SIL {ranges.silver_min}-{ranges.silver_max}")
+          f"SIL {ranges.silver_min}-{ranges.silver_max}  AGI {ranges.agi_min}-{ranges.agi_max}  "
+          f"WIS {ranges.wis_min}-{ranges.wis_max}  MDEF {ranges.mdef_min}-{ranges.mdef_max}")
     print(f"Shuffle similar-level: {args.shuffle}")
+    print(f"Shuffle identity (full record permutation): {args.shuffle_identity}")
 
     modified = randomize_enemies(
         enemies, ranges, seed,
         shuffle_similar=args.shuffle,
         level_band=args.level_band,
+        shuffle_identity=args.shuffle_identity,
     )
 
     print()
@@ -360,6 +404,9 @@ def run_gui() -> int:
                 ("HP", "hp", 0.75, 1.40),
                 ("ATK", "atk", 0.80, 1.35),
                 ("DEF", "def", 0.75, 1.40),
+                ("AGI", "agi", 0.80, 1.30),
+                ("WIS", "wis", 0.75, 1.40),
+                ("MDEF", "mdef", 0.75, 1.40),
                 ("EXP", "exp", 0.70, 1.50),
                 ("Silver", "sil", 0.70, 1.50),
             ]
@@ -381,6 +428,21 @@ def run_gui() -> int:
             ttk.Checkbutton(opts, text="Shuffle stats among similar-level enemies",
                             variable=self.shuffle_var).pack(side=tk.LEFT, padx=12)
             ttk.Button(opts, text="Randomize!", command=self.do_randomize).pack(side=tk.LEFT, padx=8)
+
+            opts2 = ttk.Frame(self, padding=(8, 0, 8, 8))
+            opts2.pack(fill=tk.X)
+            self.shuffle_identity_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                opts2, text="Shuffle monster identity (permute FULL records across slots)",
+                variable=self.shuffle_identity_var,
+            ).pack(side=tk.LEFT)
+            identity_note = ttk.Label(
+                opts2,
+                text="  Whether this changes which sprite/name shows up in a fight "
+                     "depends on the game's (unconfirmed) formation lookup — see FORMATION_NOTES.md",
+                foreground="#888888",
+            )
+            identity_note.pack(side=tk.LEFT, padx=4)
 
             # Table
             cols = ("name", "lv", "hp", "atk", "df", "exp", "sil")
@@ -476,10 +538,14 @@ def run_gui() -> int:
                 def_min=self.vars["def_min"].get(), def_max=self.vars["def_max"].get(),
                 exp_min=self.vars["exp_min"].get(), exp_max=self.vars["exp_max"].get(),
                 silver_min=self.vars["sil_min"].get(), silver_max=self.vars["sil_max"].get(),
+                agi_min=self.vars["agi_min"].get(), agi_max=self.vars["agi_max"].get(),
+                wis_min=self.vars["wis_min"].get(), wis_max=self.vars["wis_max"].get(),
+                mdef_min=self.vars["mdef_min"].get(), mdef_max=self.vars["mdef_max"].get(),
             )
             self.modified = randomize_enemies(
                 self.enemies, ranges, seed,
                 shuffle_similar=self.shuffle_var.get(),
+                shuffle_identity=self.shuffle_identity_var.get(),
             )
             self.refresh_tree(self.modified, original=self.enemies)
             self.status.configure(
@@ -498,6 +564,8 @@ def main():
     ap.add_argument("--output", "-o", help="Output binary path")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--shuffle", action="store_true", help="Shuffle among similar-level enemies")
+    ap.add_argument("--shuffle-identity", action="store_true",
+                     help="Permute FULL monster records (type/level/all stats) across table slots")
     ap.add_argument("--level-band", type=int, default=3)
     ap.add_argument("--hp-min", type=float, default=0.75)
     ap.add_argument("--hp-max", type=float, default=1.40)
@@ -509,6 +577,12 @@ def main():
     ap.add_argument("--exp-max", type=float, default=1.50)
     ap.add_argument("--sil-min", type=float, default=0.70)
     ap.add_argument("--sil-max", type=float, default=1.50)
+    ap.add_argument("--agi-min", type=float, default=0.80)
+    ap.add_argument("--agi-max", type=float, default=1.30)
+    ap.add_argument("--wis-min", type=float, default=0.75)
+    ap.add_argument("--wis-max", type=float, default=1.40)
+    ap.add_argument("--mdef-min", type=float, default=0.75)
+    ap.add_argument("--mdef-max", type=float, default=1.40)
     args = ap.parse_args()
 
     if args.cli or not sys.stdout.isatty():

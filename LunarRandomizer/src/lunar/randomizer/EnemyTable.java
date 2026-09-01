@@ -80,6 +80,9 @@ public final class EnemyTable {
         public double defMin = 0.75, defMax = 1.40;
         public double expMin = 0.70, expMax = 1.50;
         public double silverMin = 0.70, silverMax = 1.50;
+        public double agiMin = 0.80, agiMax = 1.30;
+        public double wisMin = 0.75, wisMax = 1.40;
+        public double mdefMin = 0.75, mdefMax = 1.40;
     }
 
     public static List<Enemy> load(Path path) throws IOException {
@@ -108,10 +111,43 @@ public final class EnemyTable {
 
     public static List<Enemy> randomize(List<Enemy> source, Ranges ranges, long seed,
                                         boolean shuffleSimilar, int levelBand) {
+        return randomize(source, ranges, seed, shuffleSimilar, levelBand, false);
+    }
+
+    /**
+     * shuffleIdentity: permutes ENTIRE 38-byte records across table slots
+     * (type, level, every stat -- the full monster definition), rather than
+     * just swapping individual stat values among same-level enemies. This is
+     * the closest thing to "shuffle which monster appears where" achievable
+     * without a confirmed formation/encounter table (see FORMATION_NOTES.md).
+     * Whether this changes which sprite/name shows up in a given fight
+     * depends on whether the game's formation system references monsters by
+     * this table's index -- that part is NOT yet confirmed.
+     */
+    public static List<Enemy> randomize(List<Enemy> source, Ranges ranges, long seed,
+                                        boolean shuffleSimilar, int levelBand,
+                                        boolean shuffleIdentity) {
         Random rng = new Random(seed);
         List<Enemy> result = new ArrayList<Enemy>(source.size());
         for (Enemy e : source) {
             result.add(new Enemy(e.pack()));
+        }
+
+        if (shuffleIdentity) {
+            List<Integer> activeIdxs = new ArrayList<Integer>();
+            for (int i = 0; i < result.size(); i++) {
+                if (result.get(i).isActive()) {
+                    activeIdxs.add(i);
+                }
+            }
+            List<byte[]> records = new ArrayList<byte[]>();
+            for (int i : activeIdxs) {
+                records.add(result.get(i).pack());
+            }
+            Collections.shuffle(records, rng);
+            for (int j = 0; j < activeIdxs.size(); j++) {
+                result.set(activeIdxs.get(j), new Enemy(records.get(j)));
+            }
         }
 
         for (Enemy e : result) {
@@ -123,6 +159,9 @@ public final class EnemyTable {
             e.defense = scale(rng, e.defense, ranges.defMin, ranges.defMax);
             e.exp = scale(rng, e.exp, ranges.expMin, ranges.expMax);
             e.silver = scale(rng, e.silver, ranges.silverMin, ranges.silverMax);
+            e.agility = scale(rng, e.agility, ranges.agiMin, ranges.agiMax);
+            e.wisdom = scale(rng, e.wisdom, ranges.wisMin, ranges.wisMax);
+            e.magicDefense = scale(rng, e.magicDefense, ranges.mdefMin, ranges.mdefMax);
         }
 
         if (shuffleSimilar && result.size() > 1) {
@@ -147,7 +186,8 @@ public final class EnemyTable {
                 List<int[]> packs = new ArrayList<int[]>();
                 for (int i : idxs) {
                     Enemy e = result.get(i);
-                    packs.add(new int[] { e.hp, e.attack, e.defense, e.exp, e.silver });
+                    packs.add(new int[] { e.hp, e.attack, e.defense, e.exp, e.silver,
+                            e.agility, e.wisdom, e.magicDefense });
                 }
                 Collections.shuffle(packs, rng);
                 for (int j = 0; j < idxs.size(); j++) {
@@ -158,6 +198,9 @@ public final class EnemyTable {
                     e.defense = p[2];
                     e.exp = p[3];
                     e.silver = p[4];
+                    e.agility = p[5];
+                    e.wisdom = p[6];
+                    e.magicDefense = p[7];
                 }
             }
         }
