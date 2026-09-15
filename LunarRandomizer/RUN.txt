@@ -1,0 +1,10 @@
+Lunar Randomizer v0.2
+=====================
+
+  java -jar LunarRandomizer.jar
+
+Requires Java 8+. Tabs: PSX Enemies | PSX Items | GBA Items | Pipeline | Tools
+
+Default data paths: data/psx/  and  tools/gba/lunar.gba
+Rebuild:  bash build.sh
+Notes:    NOTES.md  and  docs/
